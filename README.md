@@ -6,6 +6,17 @@ Operations console for Windows endpoints. Built-in checks map to **CIS**, **NIST
 
 ---
 
+## Easiest way: GitHub Codespaces (no install on your PC)
+
+Full click-by-click guide: **[CODESPACES.md](./CODESPACES.md)**
+
+1. Open this repo on GitHub
+2. **Code** → **Codespaces** → **Create codespace on main**
+3. Wait for setup, then in the terminal run: `npm run dev`
+4. **Ports** tab → port **8080** → visibility **Public** → click the globe
+5. **Create account** with email + password
+
+---
 ## Run on your Windows PC
 
 ### 1. Install Node.js 22 LTS
