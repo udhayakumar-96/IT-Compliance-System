@@ -103,6 +103,90 @@ $guest = Get-LocalUser -Name "Guest"
 $guestDisabled = $guest -and (-not $guest.Enabled)
 $results += PassFail $guestDisabled "guest" $(if ($guestDisabled) { "Disabled" } else { "Enabled" }) "Guest account is enabled."
 
+function RegDword([string]$Path, [string]$Name) {
+  try {
+    return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name
+  } catch { return $null }
+}
+
+# Screen lock enabled / password on resume
+$ssSecure = RegDword "HKCU:\Control Panel\Desktop" "ScreenSaverIsSecure"
+$results += PassFail ($ssSecure -eq 1) "screen-secure" "$ssSecure" "Password is not required on resume."
+$ssActive = (Get-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name ScreenSaveActive -ErrorAction SilentlyContinue).ScreenSaveActive
+$results += PassFail ($ssActive -eq "1" -or $ssActive -eq 1) "screen-saver-on" "$ssActive" "Screen saver / lock is not enabled."
+
+$inactivity = RegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "InactivityTimeoutSecs"
+if ($null -eq $inactivity) { $inactivity = 0 }
+$results += PassFail ($inactivity -gt 0 -and $inactivity -le 900) "machine-inactivity" "$inactivity s" "Machine inactivity limit exceeds 15 minutes."
+
+$noLast = RegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "DontDisplayLastUserName"
+$results += PassFail ($noLast -eq 1) "hide-last-user" "$noLast" "Last signed-in user is displayed on the logon screen."
+
+$disableCAD = RegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "DisableCAD"
+$results += PassFail ($disableCAD -eq 0 -or $null -eq $disableCAD) "ctrl-alt-del" $(if ($disableCAD -eq 1) { "Disabled" } else { "Enabled" }) "Ctrl+Alt+Del is not required at logon."
+
+# Password complexity / reversible encryption
+$complexity = $null
+$reversible = $null
+try {
+  $secedit = net accounts
+  $complexityLine = ($secedit | Select-String "password complexity").ToString()
+  $complexity = $complexityLine -match "Enabled"
+} catch { $complexity = $false }
+$results += PassFail $complexity "pwd-complexity" $(if ($complexity) { "Enabled" } else { "Disabled" }) "Password complexity is not enabled."
+
+$rev = RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" "LimitBlankPasswordUse"
+$results += PassFail ($rev -eq 1) "blank-passwords" "$rev" "Blank local passwords are not restricted."
+
+$clearText = RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" "ClearTextPassword"
+$results += PassFail ($clearText -ne 1) "pwd-reversible" $(if ($clearText -eq 1) { "Enabled" } else { "Disabled" }) "Reversible password encryption is enabled."
+
+$lockout = 0
+try {
+  $lockLine = (net accounts | Select-String "Lockout threshold").ToString() -replace "\D", ""
+  [void][int]::TryParse($lockLine, [ref]$lockout)
+} catch { $lockout = 0 }
+$results += PassFail ($lockout -gt 0 -and $lockout -le 5) "pwd-lockout-threshold" "$lockout" "Account lockout threshold is missing or above 5."
+
+# UAC extras
+$consent = RegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "ConsentPromptBehaviorAdmin"
+$results += PassFail ($consent -eq 2 -or $consent -eq 1) "uac-consent-admin" "$consent" "Administrators are not prompted for UAC consent."
+$secDesk = RegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "PromptOnSecureDesktop"
+$results += PassFail ($secDesk -eq 1) "uac-secure-desktop" "$secDesk" "UAC is not using the secure desktop."
+
+# Defender extras
+if ($mp) {
+  $cloud = $mp.MAPSReporting -ne 0
+  $results += PassFail $cloud "defender-cloud" "$($mp.MAPSReporting)" "Cloud-delivered protection is off."
+  $bhv = $mp.BehaviorMonitorEnabled
+  $results += PassFail $bhv "defender-behavior" $(if ($bhv) { "Enabled" } else { "Disabled" }) "Behavior monitoring is off."
+  $ioav = $mp.IoavProtectionEnabled
+  $results += PassFail $ioav "defender-ioav" $(if ($ioav) { "Enabled" } else { "Disabled" }) "Downloaded file scanning is off."
+}
+
+# SMBv1 / AutoPlay / NTLM
+$smb1 = $false
+try {
+  $feat = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
+  $smb1 = $feat -and ($feat.State -eq "Enabled")
+} catch { $smb1 = $false }
+$results += PassFail (-not $smb1) "smbv1" $(if ($smb1) { "Enabled" } else { "Disabled" }) "SMBv1 is enabled."
+
+$noAutoplay = RegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" "NoDriveTypeAutoRun"
+$results += PassFail ($noAutoplay -eq 255) "autoplay" "$noAutoplay" "AutoPlay is not disabled for all drives."
+
+$lm = RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" "LmCompatibilityLevel"
+$results += PassFail ($lm -ge 5) "ntlmv1" "$lm" "LM / NTLMv1 is still accepted."
+
+$nla = RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" "UserAuthentication"
+$results += PassFail ($nla -eq 1) "rdp-nla" "$nla" "RDP Network Level Authentication is off."
+
+$runAsPpl = RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" "RunAsPPL"
+$results += PassFail ($runAsPpl -eq 1) "lsa-ppl" "$runAsPpl" "LSA protection (RunAsPPL) is not enabled."
+
+$wdigest = RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest" "UseLogonCredential"
+$results += PassFail ($wdigest -ne 1) "wdigest" "$wdigest" "WDigest is storing credentials in memory."
+
 # Unauthorized remote-access tools
 $suspect = @(
   "$env:ProgramFiles\TeamViewer",

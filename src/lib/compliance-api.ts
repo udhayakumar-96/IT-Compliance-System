@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { authMiddleware } from "@/lib/auth/middleware";
 import { getSql } from "@/lib/db";
-import { BUILTIN_CHECKS, DEMO_HOSTS } from "@/lib/catalog";
+import { BUILTIN_CHECKS, DEMO_HOSTS, frameworksFor } from "@/lib/catalog";
 import { builtinCheckId, deviceId, newId } from "@/lib/ids";
 
 function toNum(v: unknown): number | null {
@@ -45,6 +45,7 @@ type AlertRow = {
   message: string;
   is_resolved: boolean;
   created_at: string;
+  notified: boolean;
 };
 
 type ResultRow = {
@@ -62,21 +63,37 @@ type ResultRow = {
 
 function failKeys(profile: (typeof DEMO_HOSTS)[number]["profile"]): Set<string> {
   if (profile === "clean") return new Set(["inventory"]);
-  if (profile === "drift") return new Set(["bitlocker", "fw-public", "updates", "lock"]);
-  if (profile === "dev") return new Set(["uac", "admins", "inventory", "password"]);
-  if (profile === "admin") return new Set(["lock", "admins"]);
-  return new Set(["updates", "defender-defs", "fw-private"]);
+  if (profile === "drift") {
+    return new Set([
+      "bitlocker",
+      "fw-public",
+      "updates",
+      "lock",
+      "pwd-complexity",
+      "screen-secure",
+      "defender-pua",
+      "wu-auto",
+    ]);
+  }
+  if (profile === "dev") {
+    return new Set(["uac", "admins", "inventory", "password", "smbv1", "autoplay", "rdp-nla", "lsa-ppl"]);
+  }
+  if (profile === "admin") return new Set(["lock", "admins", "rdp-nla", "uac-consent-admin", "screen-saver-on"]);
+  return new Set(["updates", "defender-defs", "fw-private", "wu-no-pause"]);
+}
+
+function failActual(expected: string | null): string {
+  if (expected === "On" || expected === "Enabled" || expected === "Prompt") return "Off";
+  if (expected === "Disabled" || expected === "Off" || expected === "Denied" || expected === "Not paused") return "Enabled";
+  return "Non-compliant";
 }
 
 function checkKey(check: CheckRow): string {
   return BUILTIN_CHECKS.find((c) => c.name === check.name)?.key ?? check.id;
 }
 
-async function ensureFleet(userId: string) {
+async function syncBuiltinChecks(userId: string) {
   const sql = await getSql();
-  const existing = await sql<{ c: number }>`select count(*)::int as c from devices where user_id = ${userId}`;
-  if ((existing[0]?.c ?? 0) > 0) return;
-
   for (const check of BUILTIN_CHECKS) {
     const id = builtinCheckId(userId, check.key);
     await sql`
@@ -88,8 +105,24 @@ async function ensureFleet(userId: string) {
         ${check.checkType}, ${check.expectedValue}, ${check.severity},
         ${check.remediation}, true, true
       )
+      on conflict (id) do update set
+        name = excluded.name,
+        description = excluded.description,
+        category = excluded.category,
+        check_type = excluded.check_type,
+        expected_value = excluded.expected_value,
+        severity = excluded.severity,
+        remediation = excluded.remediation,
+        is_builtin = true
     `;
   }
+}
+
+async function ensureFleet(userId: string) {
+  const sql = await getSql();
+  await syncBuiltinChecks(userId);
+  const existing = await sql<{ c: number }>`select count(*)::int as c from devices where user_id = ${userId}`;
+  if ((existing[0]?.c ?? 0) > 0) return;
 
   const checks = await sql<CheckRow>`
     select id, name, description, category, check_type, expected_value, severity, remediation, is_builtin, is_active
@@ -130,7 +163,7 @@ async function writeReport(
     const isFail = failed.has(key) || failed.has(check.name);
     if (isFail) {
       failCount += 1;
-      const actual = check.expected_value === "On" || check.expected_value === "Enabled" ? "Off" : "Non-compliant";
+      const actual = failActual(check.expected_value);
       const message = `${check.name} failed policy baseline.`;
       failDetails.push({ check, actual, message });
     } else {
@@ -155,17 +188,18 @@ async function writeReport(
     const key = checkKey(check);
     const isFail = failed.has(key) || failed.has(check.name);
     const resultId = newId("res");
-    const actual = isFail
-      ? check.expected_value === "On" || check.expected_value === "Enabled"
-        ? "Off"
-        : "Non-compliant"
-      : check.expected_value;
+    const actual = isFail ? failActual(check.expected_value) : check.expected_value;
     const message = isFail ? `${check.name} failed policy baseline.` : "Meets baseline.";
     await sql`
       insert into device_check_results (id, user_id, report_id, check_id, status, actual_value, message)
       values (${resultId}, ${userId}, ${reportId}, ${check.id}, ${isFail ? "fail" : "pass"}, ${actual}, ${message})
     `;
   }
+
+  const hostRows = await sql<{ hostname: string }>`
+    select hostname from devices where id = ${devId} and user_id = ${userId} limit 1
+  `;
+  const hostname = hostRows[0]?.hostname ?? "unknown-host";
 
   for (const detail of failDetails) {
     if (detail.check.severity !== "Critical" && detail.check.severity !== "High") continue;
@@ -180,6 +214,22 @@ async function writeReport(
       insert into alerts (id, user_id, device_id, check_id, severity, message, is_resolved)
       values (${alertId}, ${userId}, ${devId}, ${detail.check.id}, ${detail.check.severity}, ${detail.message}, false)
     `;
+    try {
+      const { dispatchAlertEmail } = await import("@/lib/email");
+      const fw = frameworksFor(detail.check.name);
+      await dispatchAlertEmail({
+        userId,
+        alertId,
+        hostname,
+        checkName: detail.check.name,
+        severity: detail.check.severity,
+        message: detail.message,
+        remediation: detail.check.remediation ?? "",
+        frameworks: fw ? `${fw.cis} · ${fw.nist} · ${fw.iso}` : "Organization policy",
+      });
+    } catch {
+      /* scan must not fail because mail failed */
+    }
   }
 }
 
@@ -311,9 +361,13 @@ export const listAlerts = createServerFn({ method: "GET" })
   .handler(async ({ context }) => {
     await ensureFleet(context.userId);
     const sql = await getSql();
-    return sql<AlertRow>`
+    const rows = await sql<AlertRow>`
       select a.id, a.device_id, d.hostname, a.check_id, c.name as check_name,
-             a.severity, a.message, a.is_resolved, a.created_at
+             a.severity, a.message, a.is_resolved, a.created_at,
+             exists(
+               select 1 from email_outbox e
+               where e.alert_id = a.id and e.user_id = ${context.userId} and e.status in ('sent', 'queued', 'failed')
+             ) as notified
       from alerts a
       join devices d on d.id = a.device_id
       left join compliance_checks c on c.id = a.check_id
@@ -321,6 +375,7 @@ export const listAlerts = createServerFn({ method: "GET" })
       order by a.is_resolved, a.created_at desc
       limit 80
     `;
+    return rows.map((row) => ({ ...row, notified: Boolean(row.notified) }));
   });
 
 export const resolveAlert = createServerFn({ method: "POST" })
@@ -382,6 +437,20 @@ export const toggleCheck = createServerFn({ method: "POST" })
       update compliance_checks set is_active = ${data.isActive}
       where id = ${data.id} and user_id = ${context.userId}
     `;
+    return { ok: true };
+  });
+
+export const setChecksActive = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { ids: string[]; isActive: boolean }) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    for (const id of data.ids) {
+      await sql`
+        update compliance_checks set is_active = ${data.isActive}
+        where id = ${id} and user_id = ${context.userId}
+      `;
+    }
     return { ok: true };
   });
 
